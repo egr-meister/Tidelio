@@ -34,7 +34,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import app.tidelio.AppContainer
 import app.tidelio.R
-import app.tidelio.domain.goals.effectiveDate
+import app.tidelio.domain.goals.GoalApplyFrom
 import app.tidelio.ui.calendar.CalendarScreen
 import app.tidelio.ui.calendar.CalendarViewModel
 import app.tidelio.ui.entry.EntryFormScreen
@@ -120,7 +120,7 @@ fun TidelioRoot(container: AppContainer, startWithSetup: Boolean) {
                 SetupScreen(
                     onGoalChosen = { goal ->
                         scope.launch {
-                            container.goals.setGoal(goal, container.todayProvider.today.value)
+                            container.setGoal(goal, GoalApplyFrom.TODAY)
                             container.preferences.setSetupDone(true)
                             finish()
                         }
@@ -143,7 +143,7 @@ fun TidelioRoot(container: AppContainer, startWithSetup: Boolean) {
                     onAddEntry = { navController.navigate(Routes.newEntry(it)) },
                     onOpenEntry = { navController.navigate(Routes.editEntry(it)) },
                     onSetGoal = { ml, from ->
-                        scope.launch { container.goals.setGoal(ml, from.effectiveDate(container.todayProvider.today.value)) }
+                        scope.launch { container.setGoal(ml, from) }
                     },
                     onBack = null,
                 )
@@ -152,7 +152,7 @@ fun TidelioRoot(container: AppContainer, startWithSetup: Boolean) {
                 Routes.DAY,
                 arguments = listOf(navArgument("epochDay") { type = NavType.LongType }),
             ) { entry ->
-                val epochDay = entry.arguments?.getLong("epochDay") ?: container.todayProvider.today.value.toEpochDay()
+                val epochDay = entry.arguments?.getLong("epochDay") ?: container.today().toEpochDay()
                 val vm: DayViewModel = viewModel(
                     factory = viewModelFactory {
                         initializer { DayViewModel(container, createSavedStateHandle(), LocalDate.ofEpochDay(epochDay)) }
@@ -164,7 +164,7 @@ fun TidelioRoot(container: AppContainer, startWithSetup: Boolean) {
                     onAddEntry = { navController.navigate(Routes.newEntry(it)) },
                     onOpenEntry = { navController.navigate(Routes.editEntry(it)) },
                     onSetGoal = { ml, from ->
-                        scope.launch { container.goals.setGoal(ml, from.effectiveDate(container.todayProvider.today.value)) }
+                        scope.launch { container.setGoal(ml, from) }
                     },
                     onBack = { navController.popBackStack() },
                 )

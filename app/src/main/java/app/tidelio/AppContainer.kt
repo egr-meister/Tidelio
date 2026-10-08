@@ -15,6 +15,9 @@ import app.tidelio.ui.common.UndoController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import app.tidelio.domain.goals.GoalApplyFrom
+import app.tidelio.domain.goals.effectiveDate
+import java.time.LocalDate
 
 /** Manual dependency injection: one container per process. */
 class AppContainer(context: Context) {
@@ -30,6 +33,14 @@ class AppContainer(context: Context) {
     val quickAddGuard = DuplicateActionGuard(windowMillis = 800L, clock = time::elapsedMillis)
     val todayProvider = TodayProvider(time, appScope)
     val undo = UndoController(appScope)
+
+    /** Current local date (read outside composition). */
+    fun today(): LocalDate = todayProvider.today.value
+
+    /** Saves a goal effective from today or tomorrow; earlier dates are untouched. */
+    suspend fun setGoal(goalMl: Int, applyFrom: GoalApplyFrom) {
+        goals.setGoal(goalMl, applyFrom.effectiveDate(today()))
+    }
 
     /** Removes entries, goals and preferences. Room work runs in a single transaction. */
     suspend fun clearAllData() {
