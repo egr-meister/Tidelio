@@ -1,0 +1,175 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TOOLS: "36.0.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0 platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Unit tests and release lint
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest lintRelease
+
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: ignore
+
+      - name: Decode PKCS12 release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::Secret ANDROID_KEYSTORE_BASE64 is not set. Release builds are never debug-signed."
+            exit 1
+          fi
+          umask 077
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.p12"
+          echo "TIDELIO_KEYSTORE_PATH=$RUNNER_TEMP/release.p12" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK and AAB
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --stacktrace assembleRelease bundleRelease
+
+      - name: Verify signatures, permissions and native libraries
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+          APK=app/build/outputs/apk/release/app-release.apk
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          REPORT=verification.txt
+          test -f "$APK" && test -f "$AAB"
+
+          norm() { tr -d ':' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
+
+          EXPECTED=$(keytool -list -v -storetype PKCS12 -keystore "$TIDELIO_KEYSTORE_PATH" \
+            -storepass:env ANDROID_KEYSTORE_PASSWORD -alias "$ANDROID_KEY_ALIAS" \
+            | grep -m1 'SHA256:' | sed 's/.*SHA256: *//' | norm)
+          echo "Expected release certificate SHA-256: $EXPECTED" | tee "$REPORT"
+
+          echo "== APK signature (apksigner verify --print-certs) ==" | tee -a "$REPORT"
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | tee apksigner.txt | tee -a "$REPORT"
+          if grep -q 'CN=Android Debug' apksigner.txt; then
+            echo "::error::APK is signed with the Android Debug certificate"; exit 1
+          fi
+          APK_SHA=$(grep -m1 'certificate SHA-256 digest' apksigner.txt | sed 's/.*digest: *//' | norm)
+          if [ "$APK_SHA" != "$EXPECTED" ]; then
+            echo "::error::APK signer ($APK_SHA) does not match the release key ($EXPECTED)"; exit 1
+          fi
+
+          echo "== AAB signature (jarsigner -verify) ==" | tee -a "$REPORT"
+          jarsigner -verify -verbose -certs "$AAB" > jarsigner.txt 2>&1 || true
+          tail -n 15 jarsigner.txt | tee -a "$REPORT"
+          if ! grep -q 'jar verified' jarsigner.txt; then
+            echo "::error::AAB signature integrity check failed"; exit 1
+          fi
+          if grep -q 'CN=Android Debug' jarsigner.txt; then
+            echo "::error::AAB is signed with the Android Debug certificate"; exit 1
+          fi
+          AAB_SHA=$(keytool -printcert -jarfile "$AAB" | grep -m1 'SHA256:' | sed 's/.*SHA256: *//' | norm)
+          echo "AAB signer SHA-256: $AAB_SHA" | tee -a "$REPORT"
+          if [ "$AAB_SHA" != "$EXPECTED" ]; then
+            echo "::error::AAB signer does not match the release key"; exit 1
+          fi
+
+          echo "== Packaged permissions (aapt2 dump permissions) ==" | tee -a "$REPORT"
+          "$BT/aapt2" dump permissions "$APK" | tee perms.txt | tee -a "$REPORT"
+          # androidx.core declares and uses an app-internal signature permission for
+          # non-exported dynamic receivers; nothing else is allowed.
+          UNEXPECTED=$(grep -i 'uses-permission' perms.txt | grep -v 'DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Unexpected permissions: $UNEXPECTED"; exit 1
+          fi
+          if grep -Eq 'android.permission.(INTERNET|ACCESS_NETWORK_STATE)' perms.txt; then
+            echo "::error::Network permission found"; exit 1
+          fi
+
+          echo "== Native libraries / 16 KB page size ==" | tee -a "$REPORT"
+          APK_SO=$(unzip -Z1 "$APK" | grep '\.so$' || true)
+          AAB_SO=$(unzip -Z1 "$AAB" | grep '\.so$' || true)
+          if [ -z "$APK_SO" ] && [ -z "$AAB_SO" ]; then
+            echo "No native .so libraries are packaged in the APK or AAB (including transitive dependencies)." | tee -a "$REPORT"
+          else
+            echo "Native libraries found:" | tee -a "$REPORT"
+            echo "$APK_SO $AAB_SO" | tee -a "$REPORT"
+            "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -n 3 | tee -a "$REPORT"
+            mkdir -p so && unzip -o -q "$APK" 'lib/*' -d so
+            FAIL=0
+            for f in $(find so -name '*.so'); do
+              for a in $(readelf -lW "$f" | awk '$1=="LOAD"{print $NF}'); do
+                if [ $((a)) -lt 16384 ]; then echo "$f LOAD align $a < 16 KB" | tee -a "$REPORT"; FAIL=1; fi
+              done
+            done
+            [ "$FAIL" = 0 ] || { echo "::error::ELF segments are not 16 KB aligned"; exit 1; }
+          fi
+
+          echo "== Artifact sizes ==" | tee -a "$REPORT"
+          ls -l "$APK" "$AAB" | awk '{print $5, $9}' | tee -a "$REPORT"
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidelio-release
+          path: |
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/bundle/release/app-release.aab
+            app/build/outputs/mapping/release/
+            verification.txt
+          if-no-files-found: error
+
+      - name: Upload Room schemas
+        uses: actions/upload-artifact@v4
+        with:
+          name: room-schemas
+          path: app/schemas/
+          if-no-files-found: warn
+
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.p12"

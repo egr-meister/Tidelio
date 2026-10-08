@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="tide_background">#FFFAF6EF</color>
+    <color name="tide_teal">#FF3F7F7A</color>
+    <color name="tide_aqua">#FFBFE6E2</color>
+    <color name="tide_icon_bg">#FFEAF4F1</color>
+    <color name="tide_slate">#FF2E3A44</color>
+</resources>
